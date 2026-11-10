@@ -1,0 +1,757 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>🐴 RAP — Stick Figure</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #1a1512;
+               touch-action: none; overscroll-behavior: none; }
+  body { -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; right: 14px; bottom: 10px; text-align: right; pointer-events: none;
+    font: 13px/1.55 ui-monospace, Consolas, monospace; color: #fff;
+    text-shadow: 0 1px 3px rgba(0,0,0,.8); opacity: .85;
+  }
+  /* touch controls — only shown when body.touch (pointer:coarse devices) */
+  #pads { display: none; position: fixed; inset: 0; pointer-events: none; z-index: 5; }
+  body.touch #pads { display: block; }
+  .pad {
+    position: absolute; pointer-events: auto; touch-action: none;
+    width: 72px; height: 72px; border-radius: 50%;
+    background: rgba(250,240,215,.16); border: 2px solid rgba(250,240,215,.45);
+    color: #fdf6e3; font: 30px/1 system-ui; display: flex; align-items: center; justify-content: center;
+    bottom: 66px;            /* above tiiny free-tier ad bar (~55px) */
+  }
+  .pad:active, .pad.held { background: rgba(250,240,215,.38); }
+  #pL { left: 16px; } #pR { left: 104px; }
+  #pW { right: 16px; font-size: 34px; } #pJ { right: 104px; width: 86px; height: 86px; bottom: 59px; }
+  #rotHint {
+    display: none; position: fixed; inset: 0; z-index: 6; flex-direction: column; gap: 12px;
+    align-items: center; justify-content: center; background: rgba(15,12,8,.88); color: #f2ead9;
+    font: 20px/1.5 system-ui; text-align: center; padding: 24px;
+  }
+  @media (orientation: portrait) { body.touch #rotHint { display: flex; } }
+  #loading {
+    position: fixed; inset: 0; z-index: 7; display: flex; align-items: center; justify-content: center;
+    background: #1a1512; color: #f2ead9; font: 15px/1.6 system-ui, sans-serif;
+    transition: opacity .35s; text-align: center; padding: 20px;
+  }
+  #end {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    pointer-events: none; opacity: 0; transition: opacity 1.6s;
+    font: 600 44px/1 Georgia, "Times New Roman", serif; color: #fff;
+    text-shadow: 0 2px 10px rgba(0,0,0,.75);
+  }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<div id="hud"></div>
+<div id="end">The end</div>
+<audio id="mus" src="song.mp3" loop preload="auto"></audio>
+<div id="pads">
+  <div class="pad" id="pL">◀</div><div class="pad" id="pR">▶</div>
+  <div class="pad" id="pJ">▲</div><div class="pad" id="pW">✋</div>
+</div>
+<div id="rotHint">📱 ⟲<br>Rotiraj telefon —<br>igra je u vodoravnom načinu</div>
+<div id="loading">Loading background &amp; animation frames…</div>
+
+<script>
+"use strict";
+/* ============================================================
+   STICK FIGURE SIDE-SCROLLER — desktop, file:// friendly.
+   Four controls only: LEFT, RIGHT, JUMP, WAVE. No scoring,
+   no obstacles, no touch, no game-over. See HANDOFF.md §2.
+
+   Errors are collected for debugging (window.__errors).
+   ============================================================ */
+window.__errors = [];
+window.addEventListener("error", e => {
+  window.__errors.push(String((e && (e.message || e.error)) || "unknown error"));
+});
+
+/* ---------- CONFIG — interpretation switches (one line each) ---------- */
+
+// Background
+const IMG_W = 26079, IMG_H = 1915;              // measured, background.jpeg
+const BG_SRC = "background.jpeg";            // relative, works from file://
+// §5 floor: 250 px measured from the BOTTOM of the image (= y 1665 from top).
+// Geometrically the only reading that fits a 700px figure. If the user really
+// meant "250 from the TOP", change the constant to: IMG_H - 250
+const FLOOR_FROM_BOTTOM_IMG = 250;
+
+// Size: 100% = the standing figure measures 300 px tall ON SCREEN; 50% (min) = 150 px.
+// (Halved 2026-11-10 per user; originally 700, then 600.) On phone-height screens it
+// is capped proportionally (see resize()).
+let FIGURE_H_FULL_PX = 300;                       // on-screen figure height at 100%
+const REF_STAND_FOOT = 344;                     // Standing-02 foot baseline (frame px)
+const REF_STAND_HEAD = 87;                      // Standing-02 head top (frame px)
+const REF_STAND_H = REF_STAND_FOOT - REF_STAND_HEAD;  // = 257 frame px of straight pose
+const ANCHOR_X = 290;                           // body x anchor inside every 605×420 frame
+
+// §6.3 growth: 50% → 100% over ONE FULL LOOP of the background (its full width),
+// driven by net rightward movement, then capped at 100%. Min 50%, max 100%.
+const GROW_LOOP_WORLD = IMG_W;                  // one loop = one image-width of scroll
+const SHRINK_ON_LEFT  = false;                  // §6.4: left does NOT shrink (flip to true)
+
+// Motion
+const WALK_SPEED_WORLD = 1120;                  // image px / second (2000 → 1400 → 1120)
+const JUMP_AIRTIME_S   = 0.9;                   // airtime (constant, size scales the height)
+const JUMP_PEAK_OF_FIG = 0.7;                   // peak = 70% of current figure height
+
+// Walk feel
+const WALK_FRAME_MS    = 85;                    // 16-frame walk cycle
+const IDLE_FRAME_MS    = 400;                   // slow breathing stand
+const TRANS_FRAME_MS   = 90;                    // walking_start_stop transitions
+const WAVESTART_FRAME_MS = 125;                 // waving_start_stop 01..04 wind-up
+const WAVELOOP_FRAME_MS  = 150;                 // waving 05..09 loop
+const WAVE_HOLD_S      = 1.6;                   // how long the wave loop plays
+
+// Story triggers (world x = background-image px; player world x = scrollX,
+// i.e. the background coordinate directly under the character's feet).
+// Shifted +1500 px right on 2026-11-10 so the visible placement matches what
+// the story used before the feet-coordinate fix. Furniture/rooms (calibrated)
+// stay untouched.
+const START_X = 1500;             // character's feet at this image px on boot
+const NPC1_X = 2900;              // 100% figure, loops 2 s standing + 2 s waving
+const NPC1_GONE_AT = 16500;       // player passes this x → NPC1 disappears for good
+const FOLLOWER_PCT = 0.9;         // 90% = 540 px
+const FOLLOWER_DIST = 300;        // world px behind the player
+const FOLLOWER_UNTIL = 10000;     // follows until the player reaches this x
+const CROWD_FROM = 7800, CROWD_TO = 9300, CROWD_N = 10;    // crowd may overlap
+const PAIR_X = 13200, PAIR_GAP = 700, PAIR_WAVE_DIST = 500; // side-by-side, no body overlap
+const LONE_X = 20900;
+const END_AT = IMG_W + NPC1_X;    // after the full loop, the NPC1 spot again → transform + end
+
+// Ending scene: a small 50% (300 px) figure walks in from the LEFT, out of frame
+const FINALE_DIST = 3000;         // starts this far to the LEFT of the player (off-screen)
+const FINALE_STOP = 250;          // stops this close beside him (on his left)
+const FINALE_DELAY_S = 1.2;       // pause before it starts walking
+const FINALE_SPEED = 900;         // world px/s
+
+// Room zones + jump-on furniture — USER-CALIBRATED positions (calibrate.html,
+// 2026-11-10). These are authoritative; the old CV guesses (bed at 12560,
+// classroom 15366..17330, last room 20394..) were wrong.
+const CLASSROOM_FROM = 14755, CLASSROOM_TO = 18183;   // RAZRED
+const LASTROOM_FROM = 18257, LASTROOM_TO = 22124;     // ZADNJA SOBA
+// One-way platforms: surfY = drawn surface in image px y (floor line is y 1665)
+const PLATFORMS = [
+  { id:"bed",    x0:5711,  x1:6297,  surfY:1471 },    // KREVET
+  { id:"desk1",  x0:16246, x1:16650, surfY:1437 },    // KLUPA 1 (u razredu)
+  { id:"desk2",  x0:16788, x1:17192, surfY:1437 },    // KLUPA 2 (u razredu)
+];
+
+// Quests per room — one word pops above the character for 3 s each time
+const QUEST_WORDS = ["Doček", "Udomljenje", "Integracija", "Prihvaćanje", "Edukacija", "Mentorstvo"];
+const WAVE_REACT_DIST = 900;    // waving makes nearby NPCs wave back for 2.5 s
+
+// Waving loop plays in BOTH directions (ping-pong 05→09→05, no hard cut)
+const WAVE_PING = [0,1,2,3,4,3,2,1];
+
+/* ---------- animation frame sets ---------- */
+const P_STAND   = [1,2,3].map(i => `frames/Standing/Standing-${String(i).padStart(2,"0")}.png`);
+const P_WALK    = Array.from({length:16},(_,k)=>`frames/walking/Walking-${String(k+1).padStart(2,"0")}.png`);
+const P_TRANS   = [1,2,3].map(i => `frames/walking_start_stop/walking_start_stop-${String(i).padStart(2,"0")}.png`);
+const P_JUMP    = Array.from({length:18},(_,k)=>`frames/jumping/jumping-${String(k+1).padStart(2,"0")}.png`);
+const P_WSTART  = [1,2,3,4].map(i => `frames/waving_start_stop/waving-${String(i).padStart(2,"0")}.png`);
+const P_WLOOP   = [5,6,7,8,9].map(i => `frames/waving/waving-${String(i).padStart(2,"0")}.png`);
+const ALL_FRAMES = [...P_STAND, ...P_WALK, ...P_TRANS, ...P_JUMP, ...P_WSTART, ...P_WLOOP];
+
+/* Foot baseline (lowest opaque row + 1) per frame — measured with PIL, alpha>64.
+   Every grounded animation frame is drawn with its own foot row pinned to the
+   floor line; jump frames additionally carry a physics offset (HANDOFF §3 note:
+   feet rise inside the jump art). */
+const FOOT = {
+  "frames/Standing/Standing-01.png":348, "frames/Standing/Standing-02.png":344, "frames/Standing/Standing-03.png":351,
+  "frames/walking/Walking-01.png":363, "frames/walking/Walking-02.png":358, "frames/walking/Walking-03.png":358,
+  "frames/walking/Walking-04.png":348, "frames/walking/Walking-05.png":357, "frames/walking/Walking-06.png":352,
+  "frames/walking/Walking-07.png":357, "frames/walking/Walking-08.png":354, "frames/walking/Walking-09.png":362,
+  "frames/walking/Walking-10.png":353, "frames/walking/Walking-11.png":359, "frames/walking/Walking-12.png":354,
+  "frames/walking/Walking-13.png":364, "frames/walking/Walking-14.png":350, "frames/walking/Walking-15.png":351,
+  "frames/walking/Walking-16.png":344,
+  "frames/walking_start_stop/walking_start_stop-01.png":348,
+  "frames/walking_start_stop/walking_start_stop-02.png":350,
+  "frames/walking_start_stop/walking_start_stop-03.png":346,
+  "frames/jumping/jumping-01.png":339, "frames/jumping/jumping-02.png":331, "frames/jumping/jumping-03.png":332,
+  "frames/jumping/jumping-04.png":331, "frames/jumping/jumping-05.png":332, "frames/jumping/jumping-06.png":316,
+  "frames/jumping/jumping-07.png":315, "frames/jumping/jumping-08.png":294, "frames/jumping/jumping-09.png":305,
+  "frames/jumping/jumping-10.png":263, "frames/jumping/jumping-11.png":248, "frames/jumping/jumping-12.png":296,
+  "frames/jumping/jumping-13.png":247, "frames/jumping/jumping-14.png":248, "frames/jumping/jumping-15.png":397,
+  "frames/jumping/jumping-16.png":312, "frames/jumping/jumping-17.png":405, "frames/jumping/jumping-18.png":272,
+  "frames/waving_start_stop/waving-01.png":353, "frames/waving_start_stop/waving-02.png":356,
+  "frames/waving_start_stop/waving-03.png":349, "frames/waving_start_stop/waving-04.png":347,
+  "frames/waving/waving-05.png":350, "frames/waving/waving-06.png":344, "frames/waving/waving-07.png":341,
+  "frames/waving/waving-08.png":343, "frames/waving/waving-09.png":348,
+};
+
+/* ---------- canvas & state ---------- */
+const cv  = document.getElementById("cv");
+const ctx = cv.getContext("2d");
+const hudEl = document.getElementById("hud");
+const loadEl = document.getElementById("loading");
+const endEl = document.getElementById("end");
+
+let canvasW = 0, canvasH = 0;      // css px == device px (DPR kept at 1 for speed)
+let k = 1;                          // image → screen scale (full height)
+let scaledW = 0;                    // full image width on screen
+let floorScreenY = 0;               // floor line in screen px
+let tiles = [], tileW = 0;          // background pre-scaled in tiles for fast looping
+let bgImg = null;
+
+const IMG_CACHE = Object.create(null);
+
+let scrollX = START_X;              // player world x (image px under feet), right = +
+let growthX = 0;                    // accumulated rightward movement, image px
+let pct = 0.5;                      // character size 50% (300 px) .. 100% (600 px)
+let facing = 1;                     // 1 = right, -1 = left
+let jumpT = -1;                     // seconds into current jump
+let stateT = 0;                     // timer for current animation state
+let state = "idle";                 // idle | walkIn | walk | walkOut | jump | wave | fall | end
+let ended = false;
+let npcClock = 0;                   // NPCs animate on their own clock, always
+const finale = { active:false, x:0, t0:0, walking:false, done:false };  // ending walker
+// vertical physics: y = feet height above floor line, in SCREEN px
+let y = 0, vy = 0;
+let elev = 0, standingOn = null;    // support height (screen px) + platform we stand on
+const questsDone = [false, false, false, false, false, false];
+let questWord = null;               // { text, t0 } — pops above the character for 3 s
+const keys = { left:false, right:false };
+let ready = false;
+let framesDrawn = 0;
+let visibleList = [];               // debug: what was drawn last frame
+
+const mod = (a, n) => ((a % n) + n) % n;
+const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+const wrapDelta = d => mod(d + IMG_W / 2, IMG_W) - IMG_W / 2;   // shortest wrapped distance
+const grounded = () => state !== "jump" && state !== "wave" && state !== "end" && state !== "fall";
+
+/* ---------- quests & platforms ---------- */
+function completeQuest(i, word) {
+  if (questsDone[i] || state === "end") return;
+  questsDone[i] = true;
+  questWord = { text: word, t0: npcClock };
+}
+const playerWorldPx = () => mod(scrollX, IMG_W);
+const platformLiftPx = p => floorScreenY - p.surfY * k;   // platform top, screen px above floor
+
+// on the way down: highest platform whose top we crossed while over its span
+function findLanding(prevH, h) {
+  const px = playerWorldPx();
+  let best = null;
+  for (const p of PLATFORMS) {
+    if (px < p.x0 || px > p.x1) continue;
+    const L = platformLiftPx(p);
+    if (L <= 0) continue;
+    if (prevH >= L - 0.5 && h <= L && (!best || L > platformLiftPx(best))) best = p;
+  }
+  return best;
+}
+function land(p) {                        // p = platform, or null for the floor
+  elev = p ? platformLiftPx(p) : 0;
+  standingOn = p || null;
+  y = elev; vy = 0; jumpT = -1;
+  state = (keys.left || keys.right) ? "walk" : "idle";
+  stateT = 0;
+  if (p && p.id === "bed") completeQuest(1, QUEST_WORDS[1]);     // quest 2: on the bed
+}
+function jumpPhysics() {                  // px/s² for the current figure size
+  const peak = FIGURE_H_FULL_PX * pct * JUMP_PEAK_OF_FIG;
+  return { v0: 4 * peak / JUMP_AIRTIME_S, g: 8 * peak / (JUMP_AIRTIME_S * JUMP_AIRTIME_S) };
+}
+function onWaveInput() {
+  // nearby NPCs wave back for a moment (interactive scene)
+  for (const n of npcs) {
+    if (n.id === "npc1" && npc1Gone) continue;
+    if (Math.abs(wrapDelta(n.x - scrollX)) < WAVE_REACT_DIST) n.reactUntil = npcClock + 2.5;
+  }
+  const px = playerWorldPx();
+  if (!npc1Gone && Math.abs(wrapDelta(NPC1_X - scrollX)) < WAVE_REACT_DIST) completeQuest(0, QUEST_WORDS[0]);
+  const pb = npcs.find(n => n.id === "pairB");
+  if (Math.abs(wrapDelta(pb.x - scrollX)) < PAIR_WAVE_DIST)   completeQuest(3, QUEST_WORDS[3]);
+  if (px >= CLASSROOM_FROM && px < CLASSROOM_TO)              completeQuest(4, QUEST_WORDS[4]);
+  if (px >= LASTROOM_FROM && px < LASTROOM_TO)                completeQuest(5, QUEST_WORDS[5]);
+}
+
+/* ---------- actions shared by keyboard and touch pads ---------- */
+function press(act) {
+  if (state === "end") return;
+  if (act === "left" || act === "right") {
+    keys[act] = true;
+    facing = act === "left" ? -1 : 1;
+    if (grounded() && state !== "walk" && state !== "walkIn") state = "walkIn", stateT = 0;
+  } else if (act === "jump") {
+    if (grounded()) {
+      state = "jump"; jumpT = 0; vy = jumpPhysics().v0; standingOn = null;
+      const px = playerWorldPx();
+      if (px >= CROWD_FROM - 100 && px <= CROWD_TO + 100) completeQuest(2, QUEST_WORDS[2]);
+    }
+  } else if (act === "wave") {
+    if (grounded()) { state = "wave"; stateT = 0; onWaveInput(); }
+  }
+}
+function release(act) {
+  if (state === "end") return;
+  if (act !== "left" && act !== "right") return;
+  keys[act] = false;
+  if (!keys.left && !keys.right && (state === "walk" || state === "walkIn")) state = "walkOut", stateT = 0;
+}
+
+/* ---------- input (exactly four actions) ---------- */
+const KEY = {
+  left:  ["ArrowLeft", "a", "A"],
+  right: ["ArrowRight", "d", "D"],
+  jump:  [" ", "Space", "ArrowUp", "w", "W"],
+  wave:  ["s", "S", "Shift", "ArrowDown"],
+};
+function which(key) {
+  for (const act of Object.keys(KEY)) if (KEY[act].includes(key)) return act;
+  return null;
+}
+window.addEventListener("keydown", e => {
+  const act = which(e.key);
+  if (!act) return;
+  e.preventDefault();
+  if (!e.repeat) press(act);
+});
+window.addEventListener("keyup", e => {
+  const act = which(e.key);
+  if (act !== "left" && act !== "right") return;
+  release(act);
+});
+
+/* ---------- touch pads (phones) ---------- */
+const isTouch = matchMedia("(pointer:coarse)").matches || "ontouchstart" in window;
+if (isTouch) document.body.classList.add("touch");
+function bindPad(id, act, hold) {
+  const el = document.getElementById(id);
+  const down = e => { e.preventDefault(); el.classList.add("held"); press(act); };
+  const up   = e => { e.preventDefault(); el.classList.remove("held"); if (hold) release(act); };
+  el.addEventListener("pointerdown", down);
+  el.addEventListener("pointerup", up);
+  el.addEventListener("pointercancel", up);
+  el.addEventListener("pointerleave", up);
+}
+bindPad("pL", "left", true);
+bindPad("pR", "right", true);
+bindPad("pJ", "jump", false);
+bindPad("pW", "wave", false);
+document.addEventListener("touchmove", e => e.preventDefault(), { passive: false });
+document.addEventListener("contextmenu", e => e.preventDefault());
+
+/* ---------- current frame for state ---------- */
+function currentFrame() {
+  switch (state) {
+    case "idle":
+      return P_STAND[Math.floor(stateT / (IDLE_FRAME_MS/1000)) % 3];
+    case "walkIn": {
+      const i = Math.floor(stateT / (TRANS_FRAME_MS/1000));
+      return i < 3 ? P_TRANS[i] : P_WALK[Math.floor((i - 3) * (TRANS_FRAME_MS/WALK_FRAME_MS)) % 16];
+    }
+    case "walk":
+      return P_WALK[Math.floor(stateT / (WALK_FRAME_MS/1000)) % 16];
+    case "walkOut":
+      return P_TRANS[2 - Math.min(2, Math.floor(stateT / (TRANS_FRAME_MS/1000)))];
+    case "jump": {
+      const t = clamp(jumpT / JUMP_AIRTIME_S, 0, 0.9999);
+      return P_JUMP[Math.floor(t * 18)];
+    }
+    case "fall":
+      return P_JUMP[10];                      // tucked legs while dropping off furniture
+    case "wave": {
+      const up = 4 * WAVESTART_FRAME_MS / 1000;               // wind-up 01→04
+      if (stateT < up) return P_WSTART[Math.min(3, Math.floor(stateT / (WAVESTART_FRAME_MS/1000)))];
+      const mid = stateT - up;
+      if (mid < WAVE_HOLD_S) return P_WLOOP[WAVE_PING[Math.floor(mid / (WAVELOOP_FRAME_MS/1000)) % 8]];
+      const dn = mid - WAVE_HOLD_S;                            // wind-down 04→01
+      if (dn < up) return P_WSTART[3 - Math.min(3, Math.floor(dn / (WAVESTART_FRAME_MS/1000)))];
+      return P_STAND[0];
+    }
+  }
+  return P_STAND[0];
+}
+
+/* ---------- NPC shared animations (time-based, no state) ---------- */
+// 4 s cycle: 2 s standing, then wave = wind-up 0.5 + loop 1.1 + wind-down 0.4
+const SHOW_PERIOD = 4;
+function showLoopFrame(t) {
+  const p = mod(t, SHOW_PERIOD);
+  if (p < 2) return P_STAND[Math.floor(p / (IDLE_FRAME_MS/1000)) % 3];
+  const w = p - 2;
+  if (w < 0.5) return P_WSTART[Math.floor(w / (WAVESTART_FRAME_MS/1000))];
+  if (w < 1.6) return P_WLOOP[WAVE_PING[Math.floor((w - 0.5) / (WAVELOOP_FRAME_MS/1000)) % 8]];
+  return P_WSTART[3 - Math.min(3, Math.floor((w - 1.6) / 0.1))];
+}
+function standLoopFrame(t) {
+  return P_STAND[Math.floor(t / (IDLE_FRAME_MS/1000)) % 3];
+}
+// 2.5 s cycle: 0.9 s jump + 1.6 s standing; peak 60% of own figure height
+function jumpLoopFrame(t) {
+  const p = mod(t, 2.5);
+  if (p >= 0.9) return { path: standLoopFrame(t), arc: 0 };
+  const q = p / 0.9;
+  return { path: P_JUMP[Math.floor(q * 17.999)], arc: 4 * q * (1 - q) * 0.6 };
+}
+
+/* ---------- deterministic NPCs (fixed seed → same scene every reload) ---------- */
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+const rand = mulberry32(20261110);
+
+const npcs = [];
+// the opening waver — 100%, 2 s stand / 2 s wave loop
+npcs.push({ id:"npc1", x:NPC1_X, pct:1, kind:"show", phase:0 });
+// crowd: 10 figures, random kinds and sizes 300–600 px
+for (let i = 0; i < CROWD_N; i++) {
+  const r = rand();
+  npcs.push({
+    id: "crowd" + i, x: CROWD_FROM + rand() * (CROWD_TO - CROWD_FROM),
+    pct: 0.5 + rand() * 0.5,
+    kind: r < 0.4 ? "stand" : r < 0.7 ? "show" : "jump",
+    phase: rand() * SHOW_PERIOD,
+  });
+}
+// pair: both stand; the second waves while the player is within ±500 px
+npcs.push({ id:"pairA", x:PAIR_X,            pct:1, kind:"stand",    phase:0 });
+npcs.push({ id:"pairB", x:PAIR_X + PAIR_GAP, pct:1, kind:"proxWave", phase:0 });
+// family: 1 adult (100%) + 3 kids (50%), spread across 15500–16940, bodies kept apart
+{
+  [ ["kid0",15500,0.5], ["kid1",15920,0.5], ["kid2",16340,0.5], ["adult",16940,1] ]
+    .forEach(([id,x,p]) => npcs.push({ id, x, pct:p, kind:"stand", phase:(x%3)/3 }));
+}
+// the loner near the end of the lap
+npcs.push({ id:"lone", x:LONE_X, pct:1, kind:"stand", phase:0 });
+
+let npc1Gone = false;
+
+// the follower: 90%, trails FOLLOWER_DIST px behind, until FOLLOWER_UNTIL
+const follower = { x: -FOLLOWER_DIST, side: -1, walking: false, alpha: 1, alive: true };
+
+/* ---------- update ---------- */
+function update(dt) {
+  npcClock += dt;
+  // ending walker: 50% figure crosses in from the left (out of frame), stops beside the hero
+  if (finale.active && !finale.done && npcClock - finale.t0 > FINALE_DELAY_S) {
+    const d = (scrollX - FINALE_STOP) - finale.x;
+    finale.x += clamp(d, -FINALE_SPEED * dt, FINALE_SPEED * dt);
+    finale.walking = Math.abs(d) > 4;
+    if (!finale.walking) finale.done = true;
+  }
+  if (state === "end") return;
+  stateT += dt;
+
+  // direction locks movement while waving, allows air-control while jumping
+  let dir = (keys.right ? 1 : 0) - (keys.left ? 1 : 0);
+  if (state === "wave") dir = 0;
+
+  if (dir !== 0) facing = dir;
+
+  if (dir !== 0) {
+    const dx = dir * WALK_SPEED_WORLD * dt;
+    scrollX += dx;
+    if (dx > 0) growthX += dx;
+    else if (SHRINK_ON_LEFT) growthX += dx;
+  }
+  growthX = clamp(growthX, 0, GROW_LOOP_WORLD);
+  pct = 0.5 + 0.5 * (growthX / GROW_LOOP_WORLD);
+
+  // story triggers
+  if (scrollX >= NPC1_GONE_AT) npc1Gone = true;
+
+  if (follower.alive) {
+    if (scrollX >= FOLLOWER_UNTIL) {
+      follower.alpha -= dt / 0.4;                       // fade out when handing off
+      if (follower.alpha <= 0) { follower.alpha = 0; follower.alive = false; }
+    } else {
+      if (dir !== 0) follower.side = -dir;              // trail on the far side of travel
+      const target = scrollX + FOLLOWER_DIST * follower.side;
+      const d = target - follower.x;
+      const v = 1550 * dt;                              // slightly faster than the player
+      const step = clamp(d, -v, v);
+      follower.x += step;
+      follower.walking = Math.abs(step / dt) > 30;      // own speed decides walk vs stand
+    }
+  }
+
+  if (!ended && growthX >= GROW_LOOP_WORLD && scrollX >= END_AT) {
+    ended = true;
+    state = "end";
+    keys.left = keys.right = false;
+    jumpT = -1;
+    finale.active = true;
+    finale.x = scrollX - FINALE_DIST;
+    finale.t0 = npcClock;
+    endEl.style.opacity = "1";
+  }
+
+  // state resolution
+  if (state === "walkIn" && stateT >= 3 * TRANS_FRAME_MS/1000 && (keys.left || keys.right)) state = "walk", stateT = 0;
+  if (state === "walkOut" && stateT >= 3 * TRANS_FRAME_MS/1000) {
+    state = (keys.left || keys.right) ? "walkIn" : "idle";
+    stateT = 0;
+  }
+  // vertical physics (jump + fall), one-way platforms over furniture
+  if (state === "jump" || state === "fall") {
+    jumpT += dt;
+    const { g } = jumpPhysics();
+    const prevY = y;
+    vy -= g * dt;
+    y += vy * dt;
+    if (vy <= 0) {
+      const p = findLanding(prevY, y);
+      if (p) land(p);
+      else if (y <= 0) { y = 0; land(null); }
+    }
+  }
+
+  // walked (or scrolled) off the edge of the furniture we were standing on
+  if (standingOn && grounded() && state !== "wave") {
+    const px = playerWorldPx();
+    if (px < standingOn.x0 || px > standingOn.x1) {
+      state = "fall"; jumpT = 0; vy = 0; standingOn = null;
+    }
+  }
+  if (state === "wave") {
+    const total = 2 * (4 * WAVESTART_FRAME_MS/1000) + WAVE_HOLD_S;
+    if (stateT >= total) { state = (keys.left || keys.right) ? "walk" : "idle"; stateT = 0; }
+  }
+}
+
+/* ---------- background tiles ---------- */
+function rebuildTiles() {
+  if (!bgImg || canvasH === 0) return;
+  k = canvasH / IMG_H;                      // full image height fills the canvas height
+  scaledW = IMG_W * k;
+  floorScreenY = canvasH - FLOOR_FROM_BOTTOM_IMG * k;
+  const N = Math.max(1, Math.ceil(scaledW / 4096));
+  tileW = scaledW / N;
+  tiles = [];
+  for (let i = 0; i < N; i++) {
+    const t = document.createElement("canvas");
+    t.width  = Math.max(1, Math.round(tileW));
+    t.height = canvasH;
+    const tc = t.getContext("2d");
+    tc.drawImage(bgImg, i * tileW / k, 0, tileW / k + 1, IMG_H, 0, 0, t.width + 1, canvasH);
+    tiles.push(t);
+  }
+  // re-anchor the player to its platform at the new scale (window resized mid-game)
+  if (standingOn && state !== "end") { elev = platformLiftPx(standingOn); y = elev; }
+}
+
+function drawBackground() {
+  if (!tiles.length) return;
+  // scrollX == the background image x directly UNDER THE CHARACTER (at 45% of
+  // the screen), so it must be subtracted when computing the tile offset.
+  // This keeps game triggers and calibrate.html coordinates in the same frame.
+  const off = mod(scrollX * k - charScreenX(), scaledW);
+  let idx = Math.floor(off / tileW);
+  let x = -(off - idx * tileW);
+  const N = tiles.length;
+  while (x < canvasW) {
+    const t = tiles[mod(idx, N)];
+    ctx.drawImage(t, 0, 0, t.width, t.height, x, 0, tileW + 1, canvasH);
+    idx++; x += tileW;
+  }
+}
+
+/* ---------- figure drawing ---------- */
+function jumpOffsetPx() { return y; }   // current feet height above floor line (screen px)
+
+function figureS(pctV) { return (FIGURE_H_FULL_PX * pctV) / REF_STAND_H; }
+
+const charScreenX = () => canvasW * 0.45;
+
+// draw one figure anchored by its feet at (screenX, floorScreenY - lift)
+function drawFigure(path, screenX, pctV, face, lift, alpha, id) {
+  const img = IMG_CACHE[path];
+  if (!img) return false;
+  const onScreen = screenX > -900 && screenX < canvasW + 900;
+  if (onScreen) {
+    const S = figureS(pctV);
+    ctx.save();
+    if (alpha < 1) ctx.globalAlpha = alpha;
+    ctx.translate(screenX, floorScreenY - lift);
+    ctx.scale(face * S, S);
+    ctx.translate(-ANCHOR_X, -(FOOT[path] || REF_STAND_FOOT));
+    ctx.drawImage(img, 0, 0);
+    ctx.restore();
+  }
+  visibleList.push({ id, sx: Math.round(screenX), path: path.split("/").pop(),
+                     pct: pctV, face, lift: Math.round(lift), onScreen });
+  return onScreen;
+}
+
+function npcWorldToScreen(wx) {
+  return charScreenX() + wrapDelta(wx - scrollX) * k;
+}
+
+function drawNpcs() {
+  for (const n of npcs) {
+    if (n.id === "npc1" && npc1Gone) continue;
+    const t = npcClock + n.phase;
+    let path, lift = 0;
+    if (n.kind === "show")       path = showLoopFrame(t);
+    else if (n.kind === "stand") path = standLoopFrame(t);
+    else if (n.kind === "jump") { const j = jumpLoopFrame(t); path = j.path; lift = FIGURE_H_FULL_PX * n.pct * j.arc; }
+    else if (n.kind === "proxWave")
+      path = Math.abs(wrapDelta(n.x - scrollX)) < PAIR_WAVE_DIST ? showLoopFrame(t) : standLoopFrame(t);
+    // waving back at the player overrides whatever the NPC was doing
+    if (npcClock < (n.reactUntil || 0)) { path = showLoopFrame(t); lift = 0; }
+    drawFigure(path, npcWorldToScreen(n.x), n.pct, 1, lift, 1, n.id);
+  }
+  // follower walks along behind until FOLLOWER_UNTIL, then fades away
+  if (follower.alive || follower.alpha > 0) {
+    const fpath = follower.walking && follower.alpha >= 1
+      ? P_WALK[Math.floor(npcClock / (WALK_FRAME_MS/1000)) % 16]
+      : standLoopFrame(npcClock);
+    drawFigure(fpath, npcWorldToScreen(follower.x), FOLLOWER_PCT,
+               -follower.side, 0, Math.max(0, Math.min(1, follower.alpha)), "follower");
+  }
+  // the small figure that walks in during the ending scene
+  if (finale.active) {
+    const fpath = finale.walking
+      ? P_WALK[Math.floor(npcClock / (WALK_FRAME_MS/1000)) % 16]
+      : standLoopFrame(npcClock);
+    drawFigure(fpath, npcWorldToScreen(finale.x), 0.5, 1, 0, 1, "finale");  // faces right, toward the hero
+  }
+}
+
+function drawPlayer() {
+  if (state === "end") {
+    // transformed into the opening NPC: same size (100%) and the same 2 s / 2 s loop
+    drawFigure(showLoopFrame(npcClock), charScreenX(), 1, 1, 0, 1, "player(end)");
+    return;
+  }
+  drawFigure(currentFrame(), charScreenX(), pct, facing, jumpOffsetPx(), 1, "player");
+}
+
+/* ---------- quest word popup: shown above the character for 3 s ---------- */
+function drawQuestWord() {
+  if (!questWord) return;
+  const age = npcClock - questWord.t0;
+  if (age > 3) { questWord = null; return; }
+  const alpha = Math.min(1, age / 0.2, (3 - age) / 0.5);
+  const figTop = floorScreenY - y - FIGURE_H_FULL_PX * (state === "end" ? 1 : pct) - 18;
+  ctx.save();
+  ctx.globalAlpha = clamp(alpha, 0, 1);
+  ctx.font = "600 30px Georgia, 'Times New Roman', serif";
+  ctx.textAlign = "center";
+  ctx.lineWidth = 5;
+  ctx.strokeStyle = "rgba(20,15,10,.75)";
+  ctx.fillStyle = "#fdf6e3";
+  const yy = Math.max(34, figTop - 14);
+  ctx.strokeText(questWord.text, charScreenX(), yy);
+  ctx.fillText(questWord.text, charScreenX(), yy);
+  ctx.restore();
+}
+
+/* ---------- main loop ---------- */
+let last = 0;
+function loop(now) {
+  requestAnimationFrame(loop);
+  if (!ready) return;
+  const dt = clamp((now - last) / 1000, 0, 0.05);
+  last = now;
+  if (dt > 0) update(dt);
+  visibleList = [];
+  ctx.clearRect(0, 0, canvasW, canvasH);
+  drawBackground();
+  drawNpcs();
+  drawPlayer();
+  drawQuestWord();
+  hudEl.textContent = state === "end"
+    ? "THE END"
+    : `SIZE ${Math.round(pct * 100)}% · QUESTS ${questsDone.filter(Boolean).length}/6  ·  ` +
+      (isTouch ? "◀ ▶ premakni · ▲ skači · ✋ mahni" : "← → move · Space jump · S wave");
+  framesDrawn++;
+}
+
+/* ---------- resize ---------- */
+function resize() {
+  canvasW = window.innerWidth;
+  canvasH = window.innerHeight;
+  cv.width = canvasW; cv.height = canvasH;
+  // phones: cap 100% figure to fit the short screen; desktop keeps 300
+  FIGURE_H_FULL_PX = canvasH < 760 ? Math.max(110, Math.min(300, canvasH * 0.39)) : 300;
+  rebuildTiles();
+}
+let resizeTimer = null;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(resize, 150);
+});
+
+/* ---------- loading ---------- */
+function loadAll() {
+  const jobs = [];
+  jobs.push(new Promise((res, rej) => {
+    bgImg = new Image();
+    bgImg.onload = res;
+    bgImg.onerror = () => rej(new Error(`Could not load ${BG_SRC} — keep the file next to the "game" folder, in "Animacija".`));
+    bgImg.src = BG_SRC;
+  }));
+  for (const p of ALL_FRAMES) {
+    jobs.push(new Promise((res, rej) => {
+      const im = new Image();
+      im.onload = () => { IMG_CACHE[p] = im; res(); };
+      im.onerror = () => rej(new Error(`Missing frame: ${p}`));
+      im.src = p;
+    }));
+  }
+  return Promise.all(jobs);
+}
+
+/* ---------- background music (loops; starts on first key/click — browsers
+   block sound before a user gesture) ---------- */
+const mus = document.getElementById("mus");
+mus.volume = 0.45;
+let musicWanted = false;
+function startMusic() {
+  musicWanted = true;
+  const p = mus.play();
+  if (p && p.catch) p.catch(() => {});      // blocked → retried on next gesture
+}
+window.addEventListener("keydown", startMusic);
+window.addEventListener("pointerdown", startMusic);
+
+/* ---------- debug hooks ---------- */
+window.__game = new Proxy({}, { get(_, key) {
+  return { pct, figH: Math.round(FIGURE_H_FULL_PX * pct), state, jumpT, facing,
+           scrollX, playerX: scrollX, growthX, floorScreenY, canvasW, canvasH, k, scaledW,
+           tileW, tiles: tiles.length, framesLoaded: Object.keys(IMG_CACHE).length,
+           framesTotal: ALL_FRAMES.length, ready, framesDrawn,
+           charX: Math.round(charScreenX()), jumpOffset: jumpOffsetPx(),
+           ended, npc1Gone, npcCount: npcs.length,
+           finale: { active: finale.active, x: Math.round(finale.x), walking: finale.walking,
+                     done: finale.done, gap: Math.round(finale.x - scrollX) },
+           y, vy, elev, standingOn: standingOn ? standingOn.id : null,
+           quests: questsDone.slice(), questWord: questWord ? questWord.text : null,
+           playerWorldPx: Math.round(playerWorldPx()),
+           followerX: Math.round(follower.x), followerAlpha: follower.alpha,
+           followerAlive: follower.alive, followerWalking: follower.walking,
+           music: { paused: mus.paused, t: Math.round(mus.currentTime), dur: Math.round(mus.duration),
+                    ready: mus.readyState } }[key];
+}});
+window.__vis = () => visibleList;
+window.__npcs = () => npcs.map(n => ({ id:n.id, x:Math.round(n.x), pct:n.pct, kind:n.kind }));
+// test-only: teleport the player world position (+ growth accordingly; keep growth if 2nd arg)
+window.__gameTest = { jumpTo(x, keepGrowth) { scrollX = x; if (!keepGrowth) {
+                                  growthX = clamp(x, 0, GROW_LOOP_WORLD);
+                                  pct = 0.5 + 0.5 * (growthX / GROW_LOOP_WORLD); } } };
+
+/* ---------- go ---------- */
+resize();
+loadAll().then(() => {
+  resize();                       // tiles now that bg exists
+  ready = true;
+  last = performance.now();
+  loadEl.style.opacity = "0";
+  setTimeout(() => loadEl.remove(), 400);
+}).catch(err => {
+  loadEl.textContent = "ERROR: " + err.message;
+  window.__errors.push(err.message);
+});
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
